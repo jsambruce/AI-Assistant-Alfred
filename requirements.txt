@@ -1,7 +1,7 @@
-smolagents>=1.24,<2
-datasets>=3,<5
-huggingface-hub>=0.34,<3
-ddgs>=9,<10
-langchain-community>=0.3,<1
-langchain-core>=0.3,<2
-rank-bm25>=0.2,<1
+smolagents==1.26.0
+datasets==4.8.5
+huggingface-hub==1.33.0
+ddgs==9.16.0
+langchain-community==0.4.2
+langchain-core==1.6.12
+rank-bm25==0.2.2

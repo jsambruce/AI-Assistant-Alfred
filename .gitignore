@@ -5,3 +5,4 @@ __pycache__/
 *.log
 .test-deps/
 .test-cache/
+.audit-run/

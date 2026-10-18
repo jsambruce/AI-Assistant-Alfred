@@ -86,6 +86,10 @@ if not os.environ.get("HF_TOKEN"):
     except Exception:
         os.environ["HF_TOKEN"] = getpass("Hugging Face token: ")
 
+os.environ["HF_TOKEN"] = os.environ.get("HF_TOKEN", "").strip()
+if not os.environ["HF_TOKEN"]:
+    raise ValueError("Add HF_TOKEN in Colab Secrets or enter a token when asked, then run this cell again.")
+
 # Leave this unset to use InferenceClientModel's default model.
 # os.environ["HF_MODEL_ID"] = "your-supported-model-id"
 ''')

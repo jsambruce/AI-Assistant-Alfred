@@ -65,6 +65,7 @@ python app.py "Tell me about Lady Ada Lovelace."
 ```
 
 The app asks for the token if `HF_TOKEN` is not already set.
+The package versions in `requirements.txt` are the versions checked with Python 3.12.
 
 ## Examples
 
