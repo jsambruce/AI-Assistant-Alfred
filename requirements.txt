@@ -1,0 +1,4 @@
+smolagents>=1.24,<2
+datasets>=3,<5
+huggingface-hub>=0.34,<2
+ddgs>=9,<10
