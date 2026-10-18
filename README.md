@@ -1,98 +1,97 @@
-# Alfred: Gala Agent with Agentic RAG
+# Alfred: Gala Planning Assistant
 
-[Open in Google Colab](https://colab.research.google.com/github/jsambruce/AI-Assistant-Alfred/blob/main/Alfred_Gala_Agent.ipynb)
+## Project Overview
 
-Implements the Hugging Face Agents Course Unit 3 assignment using **smolagents**.
-The self-contained `Alfred_Gala_Agent.ipynb` can be uploaded directly into Google Colab.
-Python 3.11 or 3.12 is recommended for local execution.
+I created Alfred to help organize a gala. He can find details about the guests,
+check sample weather conditions, search for news, and look up model downloads
+on Hugging Face.
 
-## Requirements and architecture
+I used smolagents to connect the model to these tools. Alfred chooses which tools
+to use based on the question and uses the results to put together an answer.
 
-| Assignment requirement | Implementation |
-|---|---|
-| Official guest dataset | `datasets.load_dataset('agents-course/unit3-invitees', split='train')` |
-| Private guest RAG | In-memory BM25 index over name, relation, description and email; top three positive matches with row references |
-| Web search | DuckDuckGo via `ddgs`, returning source URLs |
-| Simulated weather | Repeatable city/date scenarios explicitly marked simulated |
-| Hub statistics | Live `HfApi` lookup for an author or individual model |
-| Autonomous loop | `ToolCallingAgent` chooses JSON tool calls, consumes observations, repeats and produces a final answer; maximum eight steps |
+[Open in Colab](https://colab.research.google.com/github/jsambruce/AI-Assistant-Alfred/blob/main/Alfred_Gala_Agent.ipynb)
 
-```mermaid
-flowchart LR
-    U[Host question] --> A[Alfred model]
-    A -->|select tool and arguments| T{Tool execution}
-    T --> G[Guest BM25 index]
-    T --> S[Public web search]
-    T --> W[Simulated weather]
-    T --> H[Hugging Face Hub]
-    G --> O[Tool observations]
-    S --> O
-    W --> O
-    H --> O
-    O --> A
-    A -->|sufficient evidence| F[Final response]
-```
+## Guest Information
 
-This is agentic RAG because retrieval is a tool the model chooses when relevant,
-rather than a mandatory retrieval step before every answer. There is no hardcoded
-question router. BM25 uses term frequency, document frequency and length normalization;
-it is lexical retrieval, so paraphrases may require a keyword retry. Interests come
-from descriptions; the official schema has no separate interests field.
+I used `agents-course/unit3-invitees` for the guest list. Each guest is stored in
+a LangChain `Document` with their name, relationship to the host, description,
+and email. Their interests are included in the descriptions.
 
-## Run locally
+`BM25Retriever` searches the documents and returns up to three matches. I added
+a check for searches where none of the words match a guest document.
 
-Create a virtual environment, then:
+## Tools
+
+I added three tools alongside guest retrieval:
+
+- **Weather:** randomly selects a sample weather condition for a location.
+- **Hub statistics:** finds an author's most downloaded model and its download count.
+- **Web search:** uses DuckDuckGo to find public information and source links.
+
+The weather is simulated. Hub statistics and search results come from live requests.
+
+## Agent Setup
+
+I connected the tools to a `CodeAgent` using `InferenceClientModel`. Alfred can
+call a tool, read the result, and use another tool before answering. He decides
+when he needs the guest list, which makes this an agentic RAG setup.
+
+The agent reviews its plan every three steps and has a ten-step limit per run.
+Using `reset=False` keeps the previous exchange available for follow-up questions.
+
+The code is split into three files:
+
+- `retriever.py`: loads and searches the guest list.
+- `tools.py`: contains the weather and Hub tools and imports web search.
+- `app.py`: creates Alfred and runs questions.
+
+## Run the Notebook
+
+Open the Colab link and run the cells in order. Add a Hugging Face token to
+Colab Secrets as `HF_TOKEN` and allow notebook access. If the secret is missing,
+the notebook asks for the token with a hidden input.
+
+The token needs Inference Providers access. Some providers require credits.
+The app uses the default model from `InferenceClientModel`; `HF_MODEL_ID` can be
+set to choose another supported model.
+
+## Run Locally
+
+Use Python 3.11 or 3.12 in a virtual environment:
 
 ```text
 python -m pip install -r requirements.txt
-python -m unittest -v
-python alfred.py "Tell me about Lady Ada Lovelace from the guestbook."
+python app.py "Tell me about Lady Ada Lovelace."
 ```
 
-Set `HF_TOKEN` in your environment before the final command. Use a Hugging Face
-token with Inference Providers permission. The provider may require credits.
-`HF_MODEL_ID` can override the default `Qwen/Qwen2.5-72B-Instruct`; select a currently
-available model that supports tool calling. Model/provider availability can change.
-The notebook prompts for the token without displaying it and supports Colab Secrets.
+The app asks for the token if `HF_TOKEN` is not already set.
 
-## Demonstrations and evaluation
+## Examples
 
-The notebook includes separate guest, weather, Hub, public news and combined-tool
-prompts. Run the combined prompt and inspect the tool-name trace: guest retrieval,
-web search, weather and Hub statistics should appear. The model determines order
-and may retry; factual quality and routing need a live model evaluation.
+The notebook includes questions about a guest, weather, model downloads, and
+recent news. I also included a question that combines Tesla's guest information
+with a search about wireless energy, followed by a question using the same memory.
 
-Offline unit tests cover name/email retrieval, interest retrieval, no-match handling,
-schema validation and deterministic, labelled weather. These tests do not establish
-live provider, dataset or search availability. Notebook outputs are intentionally
-empty in the distributed artifact; no fabricated agent responses are included.
+Run these checks to test the tools without calling the model:
 
-## Privacy and limitations
+```text
+python -m unittest -v
+python check_integration.py
+```
 
-The course dataset is public teaching material, but is treated as confidential
-event context. Records are loaded at runtime and are not bundled in the repository.
-Retrieved records are sent to the selected inference provider; this is not a private
-or production deployment. Host authorization is assumed, not authenticated. Prompts
-instruct the model to keep private details out of external searches; the search tool
-also blocks email-like queries. This is a limited safeguard, not general data-loss
-prevention. Do not use real confidential guest data without access controls and a
-provider/privacy review. Tool outputs are untrusted evidence. Clear notebook outputs
-before publishing; they can contain guest details. Weather is simulated and cannot
-support real fireworks decisions. Search and Hub failures return explicit statuses.
+## Notes
 
-## Submission
+The guest list is the public course dataset. Retrieved guest details are sent
+to the model provider. Keep the token out of the files and clear guest details
+from notebook outputs before sharing.
 
-Submit [this public GitHub repository](https://github.com/jsambruce/AI-Assistant-Alfred)
-in the course portal. Alternatively, open the notebook using the Colab link above or upload it at
-[Google Colab](https://colab.research.google.com/), run it, then enable
-Share → General access → Anyone with the link → Viewer and submit the shared link.
-No course-portal submission is performed by this project.
+The Hub call leaves out the older `direction` argument because current versions
+of the library no longer accept it. Sorting by downloads still returns the most
+downloaded model first.
 
 ## References
 
-- [Course introduction](https://huggingface.co/learn/agents-course/unit3/agentic-rag/introduction)
+- [Hugging Face Agents Course, Unit 3](https://huggingface.co/learn/agents-course/unit3/agentic-rag/introduction)
 - [Guest retrieval](https://huggingface.co/learn/agents-course/unit3/agentic-rag/invitees)
-- [External tools](https://huggingface.co/learn/agents-course/unit3/agentic-rag/tools)
-- [Agent integration](https://huggingface.co/learn/agents-course/unit3/agentic-rag/agent)
-- [smolagents API](https://huggingface.co/docs/smolagents/reference/agents)
-- [Hub API](https://huggingface.co/docs/huggingface_hub/package_reference/hf_api)
+- [Tools](https://huggingface.co/learn/agents-course/unit3/agentic-rag/tools)
+- [Agent setup](https://huggingface.co/learn/agents-course/unit3/agentic-rag/agent)

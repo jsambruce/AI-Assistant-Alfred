@@ -1,4 +1,7 @@
 smolagents>=1.24,<2
 datasets>=3,<5
-huggingface-hub>=0.34,<2
+huggingface-hub>=0.34,<3
 ddgs>=9,<10
+langchain-community>=0.3,<1
+langchain-core>=0.3,<2
+rank-bm25>=0.2,<1
