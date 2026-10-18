@@ -48,8 +48,9 @@ The code is split into three files:
 ## Run the Notebook
 
 Open the Colab link and run the cells in order. Add a Hugging Face token to
-Colab Secrets as `HF_TOKEN` and allow notebook access. If the secret is missing,
-the notebook asks for the token with a hidden input.
+Colab Secrets as `HF_TOKEN` and allow notebook access. The token cell reads the
+saved secret each time it runs. After updating the secret, run that cell and
+Start Alfred again.
 
 The token needs Inference Providers access. Some providers require credits.
 The app uses the default model from `InferenceClientModel`; `HF_MODEL_ID` can be

@@ -72,25 +72,25 @@ limited each run to ten steps.
 code("%%writefile app.py\n" + (root / "app.py").read_text(encoding="utf-8"))
 markdown("""## 4. Connect to the Model
 
-I used Colab Secrets to read `HF_TOKEN`. If the secret is not available, the cell
-asks for the token with a hidden input. The token needs Inference Providers
+I read `HF_TOKEN` from Colab Secrets each time this cell runs. After changing the
+secret, run this cell and Start Alfred again. The token needs Inference Providers
 access, and the provider may require credits.
 """)
 code('''import os
-from getpass import getpass
+from google.colab import userdata
 
-if not os.environ.get("HF_TOKEN"):
-    try:
-        from google.colab import userdata
-        os.environ["HF_TOKEN"] = userdata.get("HF_TOKEN")
-    except Exception:
-        os.environ["HF_TOKEN"] = getpass("Hugging Face token: ")
+# Clear the previous value before reading the saved secret again.
+os.environ.pop("HF_TOKEN", None)
+token = userdata.get("HF_TOKEN").strip()
 
-os.environ["HF_TOKEN"] = os.environ.get("HF_TOKEN", "").strip()
-if not os.environ["HF_TOKEN"]:
-    raise ValueError("Add HF_TOKEN in Colab Secrets or enter a token when asked, then run this cell again.")
-if not os.environ["HF_TOKEN"].startswith("hf_"):
-    raise ValueError("Use a Hugging Face access token starting with hf_. Get one at https://huggingface.co/settings/tokens, update HF_TOKEN in Colab Secrets, then restart the session and run the cells again.")
+if not token.startswith("hf_"):
+    raise ValueError(
+        "Check HF_TOKEN in Colab Secrets. Paste the full token value "
+        "starting with hf_, without quotes."
+    )
+
+os.environ["HF_TOKEN"] = token
+print("Hugging Face token loaded.")
 
 # Leave this unset to use InferenceClientModel's default model.
 # os.environ["HF_MODEL_ID"] = "your-supported-model-id"
