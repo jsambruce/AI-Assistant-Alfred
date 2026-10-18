@@ -25,7 +25,10 @@ def create_alfred(model=None, guest_info_tool=None):
     if guest_info_tool is None:
         guest_info_tool = load_guest_dataset()
     if model is None:
-        settings = {"token": os.environ.get("HF_TOKEN")}
+        token = os.environ.get("HF_TOKEN", "").strip()
+        if not token.startswith("hf_"):
+            raise ValueError("HF_TOKEN must be a Hugging Face access token starting with hf_. Get one at https://huggingface.co/settings/tokens and save it in Colab Secrets.")
+        settings = {"token": token}
         if os.environ.get("HF_MODEL_ID"):
             settings["model_id"] = os.environ["HF_MODEL_ID"]
         model = InferenceClientModel(**settings)
