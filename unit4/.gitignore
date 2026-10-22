@@ -1,0 +1,7 @@
+.test-deps/
+__pycache__/
+.env
+.ipynb_checkpoints/
+downloads/
+unit4-progress.json
+test_execution.ipynb
