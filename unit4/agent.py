@@ -53,8 +53,8 @@ class FreePlanModel(OpenAIModel):
         self.last_request = None
         super().__init__(model_id=model_id, api_base="https://api.groq.com/openai/v1",
                          api_key=api_key.strip(), client_kwargs={"max_retries": 0, "timeout": 60},
-                         retry=False, max_tokens=1536, temperature=0.2,
-                         reasoning_effort="low")
+                         retry=False, max_completion_tokens=4096, temperature=0.2,
+                         reasoning_effort="low", extra_body={"include_reasoning": False})
 
     def generate(self, messages, **kwargs):
         if self.last_request is not None:
@@ -63,6 +63,10 @@ class FreePlanModel(OpenAIModel):
                 time.sleep(min(remaining, 1))
                 remaining = self.delay - (time.monotonic() - self.last_request)
         self.last_request = time.monotonic()
+        # Framework text delimiters can cut off a reasoning model before its
+        # native function call or final response. They are not needed here.
+        kwargs.pop("stop_sequences", None)
+        kwargs.pop("stop", None)
         tools = kwargs.get("tools_to_call_from") or []
         can_finish = any(tool.name == "final_answer" for tool in tools)
         if tools:
@@ -88,7 +92,11 @@ class FreePlanModel(OpenAIModel):
             raise
         if can_finish and not result.tool_calls:
             if not isinstance(result.content, str) or not result.content.strip():
-                raise ValueError("Groq returned neither a tool call nor a final answer. Try the request again.")
+                choices = getattr(result.raw, "choices", None) or []
+                reason = getattr(choices[0], "finish_reason", "unknown") if choices else "unknown"
+                if reason == "length":
+                    raise ValueError("Groq used the output limit before returning an answer. No answer was saved. Retry the question or increase max_completion_tokens within your free-plan limits.")
+                raise ValueError(f"Groq returned an empty response (finish_reason={reason}). No answer was saved. Retry the question.")
             return final_message(result.content.strip(), result)
         return result
 

@@ -90,6 +90,10 @@ class AgentTests(unittest.TestCase):
             payload = json.loads(request.content)
             requests_seen.append(payload)
             self.assertEqual(payload["tool_choice"], "auto")
+            self.assertNotIn("stop", payload)
+            self.assertNotIn("max_tokens", payload)
+            self.assertEqual(payload["max_completion_tokens"], 4096)
+            self.assertFalse(payload["include_reasoning"])
             if len(requests_seen) == 1:
                 message = {"role": "assistant", "content": None, "tool_calls": [{
                     "id": "calculate-1", "type": "function", "function": {
@@ -120,6 +124,17 @@ class AgentTests(unittest.TestCase):
 
     def test_groq_json_tool_error_regression(self):
         self.check_provider_round_trip(final_as_error=True)
+
+    def test_truncated_empty_response_is_not_an_answer(self):
+        model = FreePlanModel("gsk_test_key_not_real", delay=0)
+        reply = ChatMessage(role=MessageRole.ASSISTANT, content=None,
+                            raw=SimpleNamespace(choices=[SimpleNamespace(finish_reason="length")]))
+        with tempfile.TemporaryDirectory() as folder:
+            final = create_alfred(folder, model=ScriptedModel()).tools["final_answer"]
+            with patch("smolagents.OpenAIModel.generate", return_value=reply) as generate:
+                with self.assertRaisesRegex(ValueError, "output limit"):
+                    model.generate([], tools_to_call_from=[final], stop_sequences=["Observation:"])
+                self.assertNotIn("stop_sequences", generate.call_args.kwargs)
 
 
 class FileTests(unittest.TestCase):
