@@ -1,12 +1,15 @@
 """Alfred's Unit 4 agent, using Groq directly instead of paid HF inference."""
 from copy import deepcopy
 from importlib import resources
+import json
 import os
 import re
 import time
 
 import yaml
 from smolagents import OpenAIModel, ToolCallingAgent
+from smolagents.models import ChatMessage, MessageRole, ChatMessageToolCall, ChatMessageToolCallFunction
+from openai import BadRequestError
 
 from research_tools import build_tools
 
@@ -27,7 +30,18 @@ Finish with the final_answer tool. Return ONLY the requested answer, no explanat
 citations, markdown fences, or 'FINAL ANSWER' label. Keep reasoning and source links
 in tool observations. If evidence is unavailable, return CANNOT_ANSWER rather than
 inventing a result. This is not a gala task; do not use simulated weather or guests.
+Use native function calls with the exact supplied tool names. To finish, call
+final_answer with an answer argument, or reply with the bare final answer as text.
+There is no tool named json. Do not wrap a tool call in a markdown code block.
 """
+
+
+def final_message(answer, original=None):
+    """Translate a provider's final response into smolagents' completion tool."""
+    return ChatMessage(role=MessageRole.ASSISTANT, content=None, tool_calls=[
+        ChatMessageToolCall(id="alfred-final-response", type="function",
+            function=ChatMessageToolCallFunction(name="final_answer", arguments={"answer": answer}))],
+        token_usage=getattr(original, "token_usage", None))
 
 
 class FreePlanModel(OpenAIModel):
@@ -49,7 +63,34 @@ class FreePlanModel(OpenAIModel):
                 time.sleep(min(remaining, 1))
                 remaining = self.delay - (time.monotonic() - self.last_request)
         self.last_request = time.monotonic()
-        return super().generate(messages, **kwargs)
+        tools = kwargs.get("tools_to_call_from") or []
+        can_finish = any(tool.name == "final_answer" for tool in tools)
+        if tools:
+            # Groq may return a final text response instead of another function call.
+            kwargs["tool_choice"] = "auto"
+            kwargs["parallel_tool_calls"] = False
+        try:
+            result = super().generate(messages, **kwargs)
+        except BadRequestError as error:
+            # Recover only the observed mislabelled final-answer form. Other invalid
+            # calls and API errors still fail; no unknown function is executed.
+            detail = error.body or {}
+            detail = detail.get("error", detail)
+            try:
+                failed = json.loads(detail.get("failed_generation", ""))
+            except (ValueError, TypeError):
+                raise error
+            arguments = failed.get("arguments", {}) if isinstance(failed, dict) else {}
+            if (can_finish and detail.get("code") == "tool_use_failed" and failed.get("name") == "json"
+                    and isinstance(arguments, dict) and set(arguments) == {"answer"}
+                    and isinstance(arguments["answer"], str)):
+                return final_message(arguments["answer"])
+            raise
+        if can_finish and not result.tool_calls:
+            if not isinstance(result.content, str) or not result.content.strip():
+                raise ValueError("Groq returned neither a tool call nor a final answer. Try the request again.")
+            return final_message(result.content.strip(), result)
+        return result
 
 
 def stop_on_model_error(step, **kwargs):

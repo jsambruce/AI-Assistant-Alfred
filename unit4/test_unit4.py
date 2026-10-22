@@ -63,8 +63,9 @@ class AgentTests(unittest.TestCase):
     def test_model_calls_are_paced(self):
         model = FreePlanModel("gsk_test_key_not_real", delay=2)
         model.last_request = 100
-        with patch("agent.time.monotonic", side_effect=[100, 102, 102]), patch("agent.time.sleep") as sleep, patch("smolagents.OpenAIModel.generate", return_value="ok"):
-            self.assertEqual(model.generate([]), "ok")
+        reply = ChatMessage(role=MessageRole.ASSISTANT, content="ok")
+        with patch("agent.time.monotonic", side_effect=[100, 102, 102]), patch("agent.time.sleep") as sleep, patch("smolagents.OpenAIModel.generate", return_value=reply):
+            self.assertEqual(model.generate([]).content, "ok")
             sleep.assert_called_once_with(1)
 
     def test_answer_formatting(self):
@@ -80,6 +81,45 @@ class AgentTests(unittest.TestCase):
                 raise RuntimeError("test provider failure")
         with tempfile.TemporaryDirectory() as folder, self.assertRaises(AgentGenerationError):
             solve(question(), folder, model=BrokenModel())
+
+    def check_provider_round_trip(self, final_as_error=False):
+        import httpx
+        from openai import OpenAI
+        requests_seen = []
+        def respond(request):
+            payload = json.loads(request.content)
+            requests_seen.append(payload)
+            self.assertEqual(payload["tool_choice"], "auto")
+            if len(requests_seen) == 1:
+                message = {"role": "assistant", "content": None, "tool_calls": [{
+                    "id": "calculate-1", "type": "function", "function": {
+                        "name": "python_interpreter", "arguments": json.dumps({"code": "17 * 23"})}}]}
+            elif final_as_error:
+                return httpx.Response(400, json={"error": {"message": "attempted to call tool json",
+                    "type": "invalid_request_error", "code": "tool_use_failed",
+                    "failed_generation": '{"name":"json","arguments":{"answer":"391"}}'}})
+            else:
+                message = {"role": "assistant", "content": "391"}
+            return httpx.Response(200, json={"id": "test", "object": "chat.completion", "created": 0,
+                "model": "openai/gpt-oss-120b", "choices": [{"index": 0, "message": message,
+                "finish_reason": "tool_calls" if len(requests_seen) == 1 else "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}})
+        model = FreePlanModel("gsk_test_key_not_real", delay=0)
+        model.client = OpenAI(api_key="not-a-real-key", base_url="https://api.groq.com/openai/v1",
+                             http_client=httpx.Client(transport=httpx.MockTransport(respond)), max_retries=0)
+        with tempfile.TemporaryDirectory() as folder:
+            answer, used = solve({"question": "Use Python to calculate 17 * 23", "file_name": ""}, folder, model=model)
+        self.assertEqual(answer, "391")
+        self.assertEqual(used, ["python_interpreter"])
+        self.assertEqual(len(requests_seen), 2)
+        self.assertIn("391", str(requests_seen[1]["messages"]))
+        model.client.close()
+
+    def test_plain_text_final_answer_from_groq(self):
+        self.check_provider_round_trip()
+
+    def test_groq_json_tool_error_regression(self):
+        self.check_provider_round_trip(final_as_error=True)
 
 
 class FileTests(unittest.TestCase):

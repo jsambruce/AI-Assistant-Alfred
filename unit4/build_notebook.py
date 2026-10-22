@@ -108,6 +108,12 @@ If it fails with a rate limit, keep your key and wait for the quota to reset.
 There is no automatic switch to a paid provider.
 """)
 code('''from pathlib import Path
+import importlib
+import agent
+
+# Pick up the latest agent.py if the project-writing cells were rerun.
+importlib.invalidate_caches()
+importlib.reload(agent)
 from agent import solve
 
 Path("downloads").mkdir(exist_ok=True)
