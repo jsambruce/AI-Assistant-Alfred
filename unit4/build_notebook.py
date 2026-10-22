@@ -58,7 +58,7 @@ Course question + optional attachment
 The progress runner keeps generated answers. Sending them to the leaderboard
 is a separate action in the Space.
 """)
-for name in ["course_api.py", "research_tools.py", "agent.py", "evaluation.py", "app.py", "test_unit4.py"]:
+for name in ["course_api.py", "research_tools.py", "request_budget.py", "agent.py", "evaluation.py", "app.py", "test_unit4.py"]:
     code(f"%%writefile {name}\n" + (ROOT / name).read_text(encoding="utf-8"))
 code("%%writefile requirements.txt\n" + (ROOT / "requirements.txt").read_text())
 code("%%writefile README.md\n" + (ROOT / "README.md").read_text(encoding="utf-8"))
@@ -139,6 +139,8 @@ The status message distinguishes these failures from key-access or rate limits.
 
 The 65-second spacing between model requests reduces rate-limit errors, so this
 can take several minutes. It does not remove daily or token quotas.
+Each request also has a token budget. Older excerpts can be shortened to keep
+requests small; a request-size error is different from a quota that resets later.
 
 Some course files are missing from the file endpoint. The reader tries the
 original GAIA attachment instead. If it is gated, accept the dataset's access

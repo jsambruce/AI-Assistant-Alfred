@@ -10,12 +10,13 @@ import yaml
 from smolagents import OpenAIModel, ToolCallingAgent
 from smolagents.models import ChatMessage, MessageRole, ChatMessageToolCall, ChatMessageToolCallFunction
 from smolagents.memory import ActionStep
-from openai import BadRequestError
+from openai import APIStatusError
 
 from research_tools import build_tools
+from request_budget import INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_BUDGET, RequestSizeError, fit_request
 
 DEFAULT_MODEL = "openai/gpt-oss-120b"
-AGENT_VERSION = "tool-schema-v3"
+AGENT_VERSION = "request-budget-v4"
 INSTRUCTIONS = """You are Alfred, solving a research question for the Hugging Face Agents Course.
 Use the tools when you need facts, calculations, or information from an attachment.
 Read the supplied files before answering questions about them. Read source pages,
@@ -41,6 +42,8 @@ a search result, or a previous page's source field. To continue that page, call
 read_webpage again with the SAME url and a larger integer offset. This tool has
 no cursor, loc, page ID, or browser state. Do not invent a URL if none is available;
 use web_search to find a source first. Omit optional offsets to start at zero.
+Older tool excerpts may be shortened to fit the request limit. Never assume a
+shortened excerpt is the entire source; reread the relevant URL or file if needed.
 """
 
 
@@ -144,9 +147,10 @@ class FreePlanModel(OpenAIModel):
         self.last_request = None
         self.agent_memory = None
         self._repair_note = None
+        self.input_budget = INPUT_TOKEN_BUDGET
         super().__init__(model_id=model_id, api_base="https://api.groq.com/openai/v1",
                          api_key=api_key.strip(), client_kwargs={"max_retries": 0, "timeout": 60},
-                         retry=False, max_completion_tokens=4096, temperature=0.2,
+                         retry=False, max_completion_tokens=OUTPUT_TOKEN_BUDGET, temperature=0.2,
                          reasoning_effort="low")
 
     def _prepare_completion_kwargs(self, *args, **kwargs):
@@ -155,7 +159,7 @@ class FreePlanModel(OpenAIModel):
             prepared["messages"] = native_history(self.agent_memory)
         if self._repair_note:
             prepared["messages"].append({"role": "user", "content": self._repair_note})
-        return prepared
+        return fit_request(prepared, self.input_budget)
 
     def _wait_for_request(self):
         if self.last_request is not None:
@@ -192,7 +196,14 @@ class FreePlanModel(OpenAIModel):
                 self._wait_for_request()
                 try:
                     result = super().generate(messages, **kwargs)
-                except BadRequestError as error:
+                except APIStatusError as error:
+                    if error.status_code == 413:
+                        if attempt:
+                            raise RequestSizeError("Groq rejected the request size even after reducing the history budget.") from error
+                        # Do not resend the same oversized request. Retain this
+                        # smaller budget for later steps/questions on this model.
+                        self.input_budget = max(1200, int(self.input_budget * 0.65))
+                        continue
                     detail = error.body if isinstance(error.body, dict) else {}
                     detail = detail.get("error", detail)
                     if detail.get("code") != "tool_use_failed":

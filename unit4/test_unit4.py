@@ -15,6 +15,7 @@ from agent import FreePlanModel, ToolResponseError, argument_problem, clean_answ
 import course_api
 from evaluation import new_checkpoint, save_checkpoint, load_checkpoint, run_batch, failure_info, retry_tool_errors
 from research_tools import build_tools, file_in, extract_file, public_url
+from request_budget import INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_BUDGET, RequestSizeError, fit_request, input_size, token_count
 
 
 def question(number=1, filename=""):
@@ -92,7 +93,7 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(payload["tool_choice"], "auto")
             self.assertNotIn("stop", payload)
             self.assertNotIn("max_tokens", payload)
-            self.assertEqual(payload["max_completion_tokens"], 4096)
+            self.assertEqual(payload["max_completion_tokens"], OUTPUT_TOKEN_BUDGET)
             self.assertNotIn("include_reasoning", payload)
             self.assertNotIn("final_answer", [tool["function"]["name"] for tool in payload["tools"]])
             if len(requests_seen) == 1:
@@ -157,6 +158,8 @@ class NativeProtocolTests(unittest.TestCase):
             payload = json.loads(request.content)
             seen.append(payload)
             self.assertEqual(request.url.host, "api.groq.com")
+            self.assertLessEqual(input_size(payload), INPUT_TOKEN_BUDGET)
+            self.assertLess(input_size(payload) + payload["max_completion_tokens"], 8000)
             self.assertNotIn("final_answer", [t["function"]["name"] for t in payload["tools"]])
             pending = []
             for message in payload["messages"]:
@@ -288,6 +291,81 @@ class NativeProtocolTests(unittest.TestCase):
                      {"url": "https://example.org", "offset": "3500"},
                      {"url": "https://example.org", "offset": None}]:
             self.assertTrue(argument_problem(reader, args))
+
+    def test_413_retries_with_a_smaller_request(self):
+        error = (413, {"error": {"message": "Request too large: Limit 8000, Requested 8185",
+                                 "type": "tokens", "code": "rate_limit_exceeded"}})
+        seen = self.run_protocol([self.tool_reply("list(range(3000))"), error, self.text_reply("2999")], expected="2999")
+        self.assertGreater(input_size(seen[1]), input_size(seen[2]))
+        self.assertLessEqual(input_size(seen[2]), int(INPUT_TOKEN_BUDGET * 0.65))
+        self.assertIn("shortened", seen[2]["messages"][-1]["content"])
+
+    def test_repeated_413_is_bounded(self):
+        error = (413, {"error": {"message": "Request too large", "type": "tokens", "code": "rate_limit_exceeded"}})
+        self.run_protocol([error, error])
+
+
+class RequestBudgetTests(unittest.TestCase):
+    def history(self, count=8):
+        messages = [{"role": "system", "content": "Research using the tools."},
+                    {"role": "user", "content": "Find the reference value; preserve this question."}]
+        for i in range(count):
+            url = f"https://example.org/page-{i}"
+            messages.extend([
+                {"role": "assistant", "content": None, "tool_calls": [{"id": f"page-{i}", "type": "function",
+                    "function": {"name": "read_webpage", "arguments": json.dumps({"url": url, "offset": 3500})}}]},
+                {"role": "tool", "tool_call_id": f"page-{i}", "content": json.dumps({
+                    "source": url, "offset": 3500, "total_characters": 100000,
+                    "next_call": {"url": url, "offset": 7000},
+                    "text": " ".join(str(n) for n in range(2000))})}])
+        return {"messages": messages, "tools": [], "max_completion_tokens": OUTPUT_TOKEN_BUDGET}
+
+    def test_long_history_fits_without_mutating_question_or_memory(self):
+        original = self.history()
+        snapshot = json.loads(json.dumps(original))
+        result = fit_request(original)
+        self.assertGreater(input_size(original), INPUT_TOKEN_BUDGET)
+        self.assertLessEqual(input_size(result), INPUT_TOKEN_BUDGET)
+        self.assertEqual(original, snapshot)
+        self.assertEqual(result["messages"][:2], original["messages"][:2])
+        self.assertEqual(result["messages"][-1]["tool_call_id"], "page-7")
+        for i in range(2, len(result["messages"]), 2):
+            call, observation = result["messages"][i:i+2]
+            self.assertEqual(call["tool_calls"][0]["id"], observation["tool_call_id"])
+            metadata = json.loads(observation["content"])
+            self.assertEqual(metadata["source"], json.loads(call["tool_calls"][0]["function"]["arguments"])["url"])
+            self.assertEqual(metadata["next_call"]["offset"], 7000)
+
+    def test_long_tool_arguments_drop_only_complete_old_pairs(self):
+        request = self.history(count=5)
+        for message in request["messages"][2:-2:2]:
+            message["tool_calls"][0]["function"]["arguments"] = json.dumps({"code": " ".join(str(n) for n in range(2000))})
+        result = fit_request(request)
+        self.assertLess(len(result["messages"]), len(request["messages"]))
+        self.assertEqual(result["messages"][-2]["tool_calls"][0]["id"], "page-4")
+        self.assertEqual(result["messages"][-1]["tool_call_id"], "page-4")
+
+    def test_irreducible_question_stops_before_provider_call(self):
+        model = FreePlanModel("gsk_fixture", delay=0)
+        with patch.object(model.client.chat.completions, "create") as create:
+            with self.assertRaises(RequestSizeError):
+                model.generate([ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": " ".join(str(n) for n in range(12000))}])])
+            create.assert_not_called()
+        model.client.close()
+
+    def test_repair_instruction_and_unicode_survive(self):
+        request = self.history(count=3)
+        request["messages"][-1]["content"] = "你好 🌍 " * 5000
+        request["messages"].append({"role": "user", "content": "Supply the required url and offset."})
+        result = fit_request(request)
+        self.assertEqual(result["messages"][-1], request["messages"][-1])
+        self.assertLessEqual(input_size(result), INPUT_TOKEN_BUDGET)
+
+    def test_byte_fallback_still_enforces_limit(self):
+        with patch("request_budget.encoding", return_value=None):
+            result = fit_request(self.history(count=2))
+            self.assertLessEqual(input_size(result), INPUT_TOKEN_BUDGET)
+            self.assertEqual(token_count("你好"), len("你好".encode("utf-8")))
 
 
 class FileTests(unittest.TestCase):
@@ -433,12 +511,13 @@ class CheckpointTests(unittest.TestCase):
 
     def test_api_failures_use_actual_status(self):
         import httpx
-        from openai import BadRequestError, RateLimitError, AuthenticationError
+        from openai import APIStatusError, BadRequestError, RateLimitError, AuthenticationError
         from smolagents.monitoring import AgentLogger
         for status, error_type, body, expected, stop in [
             (400, BadRequestError, {"code": "tool_use_failed"}, "tool_format", False),
             (400, BadRequestError, {"code": "invalid_request_error"}, "model_error", True),
             (401, AuthenticationError, {}, "access", True),
+            (413, APIStatusError, {"code": "rate_limit_exceeded"}, "request_size", False),
             (429, RateLimitError, {}, "rate_limit", True)]:
             response = httpx.Response(status, request=httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions"))
             underlying = error_type("private request details", response=response, body=body)
@@ -461,6 +540,13 @@ class CheckpointTests(unittest.TestCase):
             backup = path.with_name("progress.before-tool-retry.json")
             self.assertEqual(load_checkpoint(backup), original)
             self.assertEqual(retry_tool_errors(saved, path), 0)
+
+    def test_size_update_requeues_legacy_error_and_preserves_access_failures(self):
+        saved = new_checkpoint()
+        saved["errors"] = {"legacy": "model_error: unclassified", "size": "request_size: too big", "key": "access: denied"}
+        with tempfile.TemporaryDirectory() as folder:
+            self.assertEqual(retry_tool_errors(saved, Path(folder) / "progress.json", include_request_errors=True), 2)
+            self.assertEqual(saved["errors"], {"key": "access: denied"})
 
     def test_save_restore(self):
         saved = new_checkpoint()

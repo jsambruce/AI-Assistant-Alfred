@@ -5,6 +5,7 @@ import tempfile
 
 from agent import DEFAULT_MODEL, FreePlanModel, ToolResponseError, solve
 from course_api import download_attachment, get_questions, question_hash
+from request_budget import RequestSizeError
 
 
 def new_checkpoint(model_id=DEFAULT_MODEL):
@@ -51,6 +52,8 @@ def failure_info(error):
         error = error.__cause__ or error.__context__
     names = {type(item).__name__ for item in chain}
     statuses = {getattr(item, "status_code", None) for item in chain}
+    if 413 in statuses or any(isinstance(item, RequestSizeError) for item in chain):
+        return "request_size", "The request is too large for the free-plan limit, even after shortening the history. This question remains unfinished.", False
     if 429 in statuses or "RateLimitError" in names:
         return "rate_limit", "Groq's request or token limit was reached. Wait for the quota to reset before retrying.", True
     if statuses & {401, 403} or names & {"AuthenticationError", "PermissionDeniedError"}:
@@ -69,10 +72,13 @@ def failure_info(error):
     return "task_error", "The question did not finish. Check source access, file support or available evidence.", False
 
 
-def retry_tool_errors(checkpoint, path):
+def retry_tool_errors(checkpoint, path, include_request_errors=False):
     """Requeue format failures after an update, preserving answers and a backup."""
+    prefixes = ("tool_format:", "AgentGenerationError:")
+    if include_request_errors:
+        prefixes += ("request_size:", "model_error:")
     retry_ids = [task_id for task_id, message in checkpoint["errors"].items()
-                 if isinstance(message, str) and message.startswith(("tool_format:", "AgentGenerationError:"))]
+                 if isinstance(message, str) and message.startswith(prefixes)]
     if not retry_ids:
         return 0
     path = Path(path)

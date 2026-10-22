@@ -35,6 +35,12 @@ When a tool call is invalid, the retry identifies the missing or incorrect
 arguments. Page results include the URL and offset needed to read the next part.
 A repeated format error leaves that question unfinished and the batch continues.
 Key-access and rate-limit errors stop the batch with a separate explanation.
+Before each request, Alfred estimates the tokens in the messages and tool
+definitions. It keeps that estimate below 4,800 and allows up to 2,048 output
+tokens. Older excerpts may be shortened or older tool exchanges removed; the
+question and the latest tool exchange remain. The model can reread a source.
+Groq's count can differ from the estimate, so a 413 response triggers one retry
+with a smaller history budget. This does not bypass daily or shared rate limits.
 
 The agent uses Groq's `openai/gpt-oss-120b` model. The `openai` package is the API
 client used to connect to Groq; no OpenAI account, OpenAI billing, or paid HF
@@ -115,6 +121,7 @@ Spaces do not provide durable storage by default.
 ## Files
 
 - `agent.py`: Groq connection, tool-calling loop, and final-answer formatting.
+- `request_budget.py`: token estimates and limits on research history.
 - `research_tools.py`: search, pages, attachments, audio, captions, and Python.
 - `course_api.py`: official question, file, and submission requests.
 - `evaluation.py`: batches, progress files, and unfinished questions.
