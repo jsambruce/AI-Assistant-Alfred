@@ -1,7 +1,7 @@
 smolagents==1.26.0
 openai==2.54.0
 gradio[oauth]==6.30.0
-requests==2.34.2
+requests==2.32.4
 ddgs==9.16.0
 beautifulsoup4==4.15.0
 pypdf==6.21.2
