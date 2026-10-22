@@ -93,15 +93,16 @@ class AgentTests(unittest.TestCase):
             self.assertNotIn("stop", payload)
             self.assertNotIn("max_tokens", payload)
             self.assertEqual(payload["max_completion_tokens"], 4096)
-            self.assertFalse(payload["include_reasoning"])
+            self.assertNotIn("include_reasoning", payload)
+            self.assertNotIn("final_answer", [tool["function"]["name"] for tool in payload["tools"]])
             if len(requests_seen) == 1:
                 message = {"role": "assistant", "content": None, "tool_calls": [{
                     "id": "calculate-1", "type": "function", "function": {
                         "name": "python_interpreter", "arguments": json.dumps({"code": "17 * 23"})}}]}
-            elif final_as_error:
+            elif final_as_error and len(requests_seen) == 2:
                 return httpx.Response(400, json={"error": {"message": "attempted to call tool json",
                     "type": "invalid_request_error", "code": "tool_use_failed",
-                    "failed_generation": '{"name":"json","arguments":{"answer":"391"}}'}})
+                    "failed_generation": '{"name": "answer", "arguments": 999"}'}})
             else:
                 message = {"role": "assistant", "content": "391"}
             return httpx.Response(200, json={"id": "test", "object": "chat.completion", "created": 0,
@@ -115,8 +116,15 @@ class AgentTests(unittest.TestCase):
             answer, used = solve({"question": "Use Python to calculate 17 * 23", "file_name": ""}, folder, model=model)
         self.assertEqual(answer, "391")
         self.assertEqual(used, ["python_interpreter"])
-        self.assertEqual(len(requests_seen), 2)
-        self.assertIn("391", str(requests_seen[1]["messages"]))
+        self.assertEqual(len(requests_seen), 3 if final_as_error else 2)
+        history = requests_seen[1]["messages"]
+        self.assertEqual([m["role"] for m in history], ["system", "user", "assistant", "tool"])
+        self.assertEqual(history[-1]["tool_call_id"], "calculate-1")
+        self.assertIn("391", history[-1]["content"])
+        self.assertEqual(json.loads(history[-2]["tool_calls"][0]["function"]["arguments"]), {"code": "17 * 23"})
+        if final_as_error:
+            self.assertNotIn("999", str(requests_seen[2]["messages"]))
+            self.assertEqual(requests_seen[2]["messages"][-1]["role"], "user")
         model.client.close()
 
     def test_plain_text_final_answer_from_groq(self):
@@ -135,6 +143,103 @@ class AgentTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "output limit"):
                     model.generate([], tools_to_call_from=[final], stop_sequences=["Observation:"])
                 self.assertNotIn("stop_sequences", generate.call_args.kwargs)
+
+
+class NativeProtocolTests(unittest.TestCase):
+    """Exercise real framework execution and SDK serialization, with fake HTTP only."""
+
+    def run_protocol(self, replies, expected=None, tasks=1):
+        import httpx
+        from openai import OpenAI
+        seen = []
+
+        def respond(request):
+            payload = json.loads(request.content)
+            seen.append(payload)
+            self.assertEqual(request.url.host, "api.groq.com")
+            self.assertNotIn("final_answer", [t["function"]["name"] for t in payload["tools"]])
+            pending = []
+            for message in payload["messages"]:
+                if pending:
+                    self.assertEqual(message["role"], "tool")
+                    self.assertEqual(message["tool_call_id"], pending.pop(0))
+                if message.get("tool_calls"):
+                    for call in message["tool_calls"]:
+                        self.assertIsInstance(json.loads(call["function"]["arguments"]), dict)
+                        pending.append(call["id"])
+            self.assertFalse(pending)
+            status, message = replies.pop(0)
+            if status != 200:
+                return httpx.Response(status, json=message)
+            return httpx.Response(200, json={"id": "fixture", "object": "chat.completion", "created": 0,
+                "model": "openai/gpt-oss-120b", "choices": [{"index": 0, "message": message,
+                "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+
+        model = FreePlanModel("gsk_test_key_not_real", delay=0)
+        model.client = OpenAI(api_key="fixture", base_url="https://api.groq.com/openai/v1",
+            http_client=httpx.Client(transport=httpx.MockTransport(respond)), max_retries=0)
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                for index in range(tasks):
+                    sample = {"question": f"Task {index}: use Python for the calculation.", "file_name": ""}
+                    if expected is None:
+                        with self.assertRaises(AgentGenerationError):
+                            solve(sample, folder, model=model)
+                    else:
+                        answer, used = solve(sample, folder, model=model)
+                        self.assertEqual(answer, expected)
+                        self.assertTrue(used)
+        finally:
+            model.client.close()
+        self.assertFalse(replies, "Expected requests were not made")
+        return seen
+
+    def tool_reply(self, code, call_id="python-1", name="python_interpreter"):
+        return (200, {"role": "assistant", "content": None, "tool_calls": [{
+            "id": call_id, "type": "function", "function": {
+                "name": name, "arguments": json.dumps({"code": code})}}]})
+
+    def text_reply(self, text):
+        return (200, {"role": "assistant", "content": text})
+
+    def test_two_real_python_steps(self):
+        seen = self.run_protocol([self.tool_reply("7 * 8"), self.tool_reply("56 + 9", "python-2"),
+                                  self.text_reply("65")], expected="65")
+        self.assertIn("56", seen[1]["messages"][-1]["content"])
+        self.assertIn("65", seen[2]["messages"][-1]["content"])
+        self.assertEqual([m["role"] for m in seen[2]["messages"]],
+                         ["system", "user", "assistant", "tool", "assistant", "tool"])
+
+    def test_tool_exception_sent_as_tool_result(self):
+        seen = self.run_protocol([self.tool_reply("1 / 0"), self.tool_reply("7 * 8", "python-2"),
+                                  self.text_reply("56")], expected="56")
+        self.assertIn("error", seen[1]["messages"][-1]["content"].lower())
+
+    def test_empty_response_gets_one_repair(self):
+        seen = self.run_protocol([self.tool_reply("9 * 9"), self.text_reply(""), self.text_reply("81")], expected="81")
+        self.assertEqual(seen[2]["messages"][-1]["role"], "user")
+        self.assertIn("81", seen[2]["messages"][-2]["content"])
+
+    def test_repeated_empty_response_stops(self):
+        self.run_protocol([self.tool_reply("9 * 9"), self.text_reply(""), self.text_reply("")])
+
+    def test_repeated_malformed_response_stops_without_using_error_answer(self):
+        error = (400, {"error": {"message": "Invalid call", "type": "invalid_request_error",
+            "code": "tool_use_failed", "failed_generation": '{"name":"json","arguments":{"answer":"999"}}'}})
+        self.run_protocol([self.tool_reply("9 * 9"), error, error])
+
+    def test_quota_error_is_not_retried(self):
+        self.run_protocol([(429, {"error": {"message": "Quota exhausted", "type": "rate_limit_error"}})])
+
+    def test_unknown_function_is_not_executed(self):
+        self.run_protocol([self.tool_reply("1", name="unknown"), self.tool_reply("1", name="unknown")])
+
+    def test_new_question_does_not_reuse_previous_memory(self):
+        seen = self.run_protocol([self.tool_reply("7 * 8"), self.text_reply("56"),
+                                  self.tool_reply("7 * 8"), self.text_reply("56")], expected="56", tasks=2)
+        self.assertEqual([m["role"] for m in seen[2]["messages"]], ["system", "user"])
+        self.assertNotIn("Task 0:", str(seen[2]["messages"]))
 
 
 class FileTests(unittest.TestCase):

@@ -104,6 +104,7 @@ assert result.wasSuccessful()
 markdown("""## 5. Try the Live Model
 
 This simple calculation checks the real Groq connection and the Python tool.
+Use the single code cell below. No diagnostic or patch cells are needed.
 If it fails with a rate limit, keep your key and wait for the quota to reset.
 There is no automatic switch to a paid provider.
 """)
@@ -115,6 +116,7 @@ import agent
 importlib.invalidate_caches()
 importlib.reload(agent)
 from agent import solve
+print("Alfred version:", agent.AGENT_VERSION)
 
 Path("downloads").mkdir(exist_ok=True)
 sample = {"question": "Use the Python tool to calculate 17 * 23. Return only the integer.",
@@ -123,6 +125,8 @@ answer, used_tools = solve(sample, "downloads")
 print("Answer:", answer)
 print("Tools:", used_tools)
 assert answer == "391", "Review the model's answer before running evaluation questions."
+assert "python_interpreter" in used_tools, "The model did not use the Python tool."
+print("Alfred test passed.")
 ''')
 markdown("""## 6. Run a Small Evaluation Batch
 

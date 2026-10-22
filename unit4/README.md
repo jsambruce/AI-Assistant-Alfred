@@ -27,6 +27,11 @@ general research tools instead. The final answer contains only the requested
 result because the course compares answers by exact match. The tool trace keeps
 track of the actions used to reach an answer.
 
+The Groq connection sends each tool call with its matching tool result. The model
+can request another tool or finish with a plain-text answer. smolagents still
+controls tool execution and the step limit. An empty or malformed response gets
+one retry; an error response is never used as an answer.
+
 The agent uses Groq's `openai/gpt-oss-120b` model. The `openai` package is the API
 client used to connect to Groq; no OpenAI account, OpenAI billing, or paid HF
 inference is involved. The account must stay on Groq's Free plan. This code cannot
