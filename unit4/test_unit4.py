@@ -11,9 +11,9 @@ from smolagents import Model, ChatMessage, MessageRole
 from smolagents.models import ChatMessageToolCall, ChatMessageToolCallFunction
 from smolagents.utils import AgentGenerationError
 
-from agent import FreePlanModel, clean_answer, create_alfred, solve
+from agent import FreePlanModel, ToolResponseError, argument_problem, clean_answer, create_alfred, solve
 import course_api
-from evaluation import new_checkpoint, save_checkpoint, load_checkpoint, run_batch
+from evaluation import new_checkpoint, save_checkpoint, load_checkpoint, run_batch, failure_info, retry_tool_errors
 from research_tools import build_tools, file_in, extract_file, public_url
 
 
@@ -241,6 +241,54 @@ class NativeProtocolTests(unittest.TestCase):
         self.assertEqual([m["role"] for m in seen[2]["messages"]], ["system", "user"])
         self.assertNotIn("Task 0:", str(seen[2]["messages"]))
 
+    def function_reply(self, name, arguments, call_id):
+        return (200, {"role": "assistant", "content": None, "tool_calls": [{
+            "id": call_id, "type": "function", "function": {
+                "name": name, "arguments": json.dumps(arguments)}}]})
+
+    @patch("research_tools.fetch_page")
+    @patch("ddgs.DDGS")
+    def test_search_read_and_pagination_after_exact_missing_url_error(self, search, fetch):
+        url = "https://example.org/source"
+        search.return_value.text.return_value = [{"title": "Fixture source", "href": url, "body": "A reference"}]
+        fetch.return_value = (url, ("<p>" + "x" * 3600 + " Reference value: 42.</p>").encode(), "text/html")
+        malformed = (400, {"error": {
+            "message": "Tool call validation failed: parameters for read_webpage did not match schema: missing properties: url",
+            "type": "invalid_request_error", "code": "tool_use_failed",
+            "failed_generation": '{"name":"read_webpage","arguments":{"cursor":0,"loc":3000}}'}})
+        seen = self.run_protocol([
+            self.function_reply("web_search", {"query": "reference value"}, "search-1"),
+            malformed,
+            self.function_reply("read_webpage", {"url": url, "offset": 0}, "page-1"),
+            self.function_reply("read_webpage", {"url": url, "offset": 3500}, "page-2"),
+            self.text_reply("42")], expected="42")
+        note = seen[2]["messages"][-1]["content"]
+        self.assertIn("Missing required arguments: url", note)
+        self.assertIn("Unrecognized arguments: cursor, loc", note)
+        self.assertIn("url: string (required)", note)
+        self.assertIn("offset: integer (optional)", note)
+        first_page = json.loads(seen[3]["messages"][-1]["content"])
+        self.assertEqual(first_page["next_call"], {"url": url, "offset": 3500})
+        self.assertIn("Reference value: 42", seen[4]["messages"][-1]["content"])
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual([call.args[0] for call in fetch.call_args_list], [url, url])
+
+    @patch("research_tools.fetch_page")
+    def test_invalid_arguments_in_success_response_are_not_executed(self, fetch):
+        malformed = self.function_reply("read_webpage", {"cursor": 0, "loc": 3000}, "bad-1")
+        seen = self.run_protocol([malformed, malformed])
+        fetch.assert_not_called()
+        self.assertIn("Missing required arguments: url", seen[1]["messages"][-1]["content"])
+
+    def test_argument_types_and_optional_offsets(self):
+        tools = {tool.name: tool for tool in build_tools(".", "unused")}
+        reader = tools["read_webpage"]
+        self.assertEqual(argument_problem(reader, {"url": "https://example.org"}), "")
+        for args in [{"url": 1}, {"url": "https://example.org", "offset": True},
+                     {"url": "https://example.org", "offset": "3500"},
+                     {"url": "https://example.org", "offset": None}]:
+            self.assertTrue(argument_problem(reader, args))
+
 
 class FileTests(unittest.TestCase):
     def test_attachment_cannot_leave_task_directory(self):
@@ -362,6 +410,58 @@ class CourseTests(unittest.TestCase):
 
 
 class CheckpointTests(unittest.TestCase):
+    @patch("evaluation.download_attachment")
+    @patch("evaluation.solve")
+    def test_tool_failure_continues_batch_without_saving_failed_answer(self, solve_mock, download):
+        from smolagents.monitoring import AgentLogger
+        wrapper = AgentGenerationError("fixture tool failure", AgentLogger())
+        wrapper.__cause__ = ToolResponseError("invalid read_webpage arguments")
+        solve_mock.side_effect = [wrapper, ("10", ["python_interpreter"])]
+        saved = new_checkpoint()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "progress.json"
+            events = list(run_batch(saved, path, "unused", max_questions=2,
+                                    questions=[question(1), question(2)], model=object()))
+            restored = load_checkpoint(path)
+        self.assertEqual(solve_mock.call_count, 2)
+        self.assertNotIn(question(1)["task_id"], restored["answers"])
+        self.assertTrue(restored["errors"][question(1)["task_id"]].startswith("tool_format:"))
+        self.assertEqual(restored["answers"][question(2)["task_id"]]["answer"], "10")
+        messages = " ".join(event[0] for event in events)
+        self.assertNotIn("quota", messages)
+        self.assertNotIn("key", messages)
+
+    def test_api_failures_use_actual_status(self):
+        import httpx
+        from openai import BadRequestError, RateLimitError, AuthenticationError
+        from smolagents.monitoring import AgentLogger
+        for status, error_type, body, expected, stop in [
+            (400, BadRequestError, {"code": "tool_use_failed"}, "tool_format", False),
+            (400, BadRequestError, {"code": "invalid_request_error"}, "model_error", True),
+            (401, AuthenticationError, {}, "access", True),
+            (429, RateLimitError, {}, "rate_limit", True)]:
+            response = httpx.Response(status, request=httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions"))
+            underlying = error_type("private request details", response=response, body=body)
+            wrapper = AgentGenerationError("fixture", AgentLogger())
+            wrapper.__cause__ = underlying
+            category, message, stopped = failure_info(wrapper)
+            self.assertEqual((category, stopped), (expected, stop))
+            self.assertNotIn("private request details", message)
+
+    def test_retry_preserves_answers_unrelated_errors_and_backup(self):
+        saved = new_checkpoint()
+        saved["answers"][question(1)["task_id"]] = {"answer": "10"}
+        saved["errors"] = {"old": "AgentGenerationError: old status", "new": "tool_format: failed", "file": "attachment: missing"}
+        original = json.loads(json.dumps(saved))
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "progress.json"
+            self.assertEqual(retry_tool_errors(saved, path), 2)
+            self.assertEqual(load_checkpoint(path)["answers"], original["answers"])
+            self.assertEqual(saved["errors"], {"file": "attachment: missing"})
+            backup = path.with_name("progress.before-tool-retry.json")
+            self.assertEqual(load_checkpoint(backup), original)
+            self.assertEqual(retry_tool_errors(saved, path), 0)
+
     def test_save_restore(self):
         saved = new_checkpoint()
         with tempfile.TemporaryDirectory() as folder:

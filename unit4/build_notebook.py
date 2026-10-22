@@ -134,6 +134,8 @@ This cell retrieves the current course questions and tries three unfinished
 questions. It saves progress to `unit4-progress.json` after each question. Rerun
 the cell to continue. Failed questions are kept out of the answer list; use the
 Space's retry control when the source or quota issue has been resolved.
+Tool-format failures leave that question unfinished while the batch continues.
+The status message distinguishes these failures from key-access or rate limits.
 
 The 65-second spacing between model requests reduces rate-limit errors, so this
 can take several minutes. It does not remove daily or token quotas.

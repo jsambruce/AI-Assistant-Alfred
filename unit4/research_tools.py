@@ -89,11 +89,12 @@ def build_tools(directory, api_key):
 
     @tool
     def read_webpage(url: str, offset: int = 0) -> str:
-        """Read a web page or public PDF. Use offsets to continue long sources.
+        """Read a URL from search results or the question. For the next part,
+        repeat the same url with a larger offset. There is no browser cursor.
 
         Args:
-            url: Source URL from a search result or the question.
-            offset: Starting character position in the extracted text.
+            url: Required full http or https source URL, including on repeat calls.
+            offset: Starting character position, default 0. Use offset, not loc or cursor.
         """
         final_url, data, kind = fetch_page(url)
         if "pdf" in kind.lower() or data.startswith(b"%PDF"):
@@ -106,7 +107,9 @@ def build_tools(directory, api_key):
             text = soup.get_text("\n", strip=True)
         offset = max(0, offset)
         return json.dumps({"source": final_url, "total_characters": len(text),
-                           "offset": offset, "text": text[offset:offset + 3500]})
+                           "offset": offset, "text": text[offset:offset + 3500],
+                           "next_call": {"url": final_url, "offset": offset + 3500}
+                           if offset + 3500 < len(text) else None})
 
     @tool
     def read_attachment(filename: str, offset: int = 0) -> str:

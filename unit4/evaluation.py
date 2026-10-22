@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 
-from agent import DEFAULT_MODEL, FreePlanModel, solve
+from agent import DEFAULT_MODEL, FreePlanModel, ToolResponseError, solve
 from course_api import download_attachment, get_questions, question_hash
 
 
@@ -42,6 +42,49 @@ def rows(checkpoint, questions):
     return output
 
 
+def failure_info(error):
+    """Classify the underlying exception without saving provider request data."""
+    chain, seen = [], set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        chain.append(error)
+        error = error.__cause__ or error.__context__
+    names = {type(item).__name__ for item in chain}
+    statuses = {getattr(item, "status_code", None) for item in chain}
+    if 429 in statuses or "RateLimitError" in names:
+        return "rate_limit", "Groq's request or token limit was reached. Wait for the quota to reset before retrying.", True
+    if statuses & {401, 403} or names & {"AuthenticationError", "PermissionDeniedError"}:
+        return "access", "Groq rejected access. Check the saved key and model permissions.", True
+    if 402 in statuses:
+        return "billing", "The provider rejected the request for billing reasons. Check your account's free-plan access.", True
+    for item in chain:
+        body = getattr(item, "body", None)
+        detail = body.get("error", body) if isinstance(body, dict) else {}
+        if isinstance(item, ToolResponseError) or (isinstance(detail, dict) and detail.get("code") == "tool_use_failed"):
+            return "tool_format", "The model could not produce a valid tool call or answer after correction. Retry this question later.", False
+    if "FileNotFoundError" in names:
+        return "attachment", "The attachment is unavailable. Check GAIA access and the optional read-access HF_TOKEN.", False
+    if "AgentGenerationError" in names:
+        return "model_error", "The model request failed. The error does not establish a key or quota problem.", True
+    return "task_error", "The question did not finish. Check source access, file support or available evidence.", False
+
+
+def retry_tool_errors(checkpoint, path):
+    """Requeue format failures after an update, preserving answers and a backup."""
+    retry_ids = [task_id for task_id, message in checkpoint["errors"].items()
+                 if isinstance(message, str) and message.startswith(("tool_format:", "AgentGenerationError:"))]
+    if not retry_ids:
+        return 0
+    path = Path(path)
+    backup = path.with_name(path.stem + ".before-tool-retry.json")
+    if not backup.exists():
+        save_checkpoint(checkpoint, backup)
+    for task_id in retry_ids:
+        checkpoint["errors"].pop(task_id)
+    save_checkpoint(checkpoint, path)
+    return len(retry_ids)
+
+
 def run_batch(checkpoint, path, api_key, max_questions=3, questions=None, model=None):
     questions = questions or get_questions()
     if model is None:
@@ -65,18 +108,13 @@ def run_batch(checkpoint, path, api_key, max_questions=3, questions=None, model=
             checkpoint["errors"].pop(task_id, None)
         except Exception as error:
             # Do not store provider exceptions: they can include request details.
-            message = "task did not finish. Check the key, limits, source access, or file support."
-            if isinstance(error, FileNotFoundError):
-                message = "attachment unavailable from the course/GAIA. Check GAIA access and optional read-access HF_TOKEN."
-            checkpoint["errors"][task_id] = type(error).__name__ + ": " + message
+            category, message, stop_batch = failure_info(error)
+            checkpoint["errors"][task_id] = category + ": " + message
             save_checkpoint(checkpoint, path)
-            yield "This question did not finish. Completed answers were saved.", checkpoint
-            cause = error
-            while cause is not None:
-                if type(cause).__name__ in {"AgentGenerationError", "RateLimitError", "AuthenticationError", "PermissionDeniedError"}:
-                    yield "Stopped because the model could not respond. Check Groq key/model access or wait for the free quota to reset, then use Retry unfinished questions.", checkpoint
-                    return
-                cause = cause.__cause__ or cause.__context__
+            yield f"Question unfinished: {message} Completed answers were saved.", checkpoint
+            if stop_batch:
+                yield f"Stopped because: {message}", checkpoint
+                return
             continue
         save_checkpoint(checkpoint, path)
         yield f"Saved {len(checkpoint['answers'])}/{len(questions)} answers.", checkpoint

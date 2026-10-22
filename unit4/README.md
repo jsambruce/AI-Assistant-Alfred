@@ -31,6 +31,10 @@ The Groq connection sends each tool call with its matching tool result. The mode
 can request another tool or finish with a plain-text answer. smolagents still
 controls tool execution and the step limit. An empty or malformed response gets
 one retry; an error response is never used as an answer.
+When a tool call is invalid, the retry identifies the missing or incorrect
+arguments. Page results include the URL and offset needed to read the next part.
+A repeated format error leaves that question unfinished and the batch continues.
+Key-access and rate-limit errors stop the batch with a separate explanation.
 
 The agent uses Groq's `openai/gpt-oss-120b` model. The `openai` package is the API
 client used to connect to Groq; no OpenAI account, OpenAI billing, or paid HF

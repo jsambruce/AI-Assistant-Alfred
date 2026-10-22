@@ -15,7 +15,7 @@ from openai import BadRequestError
 from research_tools import build_tools
 
 DEFAULT_MODEL = "openai/gpt-oss-120b"
-AGENT_VERSION = "native-tools-v2"
+AGENT_VERSION = "tool-schema-v3"
 INSTRUCTIONS = """You are Alfred, solving a research question for the Hugging Face Agents Course.
 Use the tools when you need facts, calculations, or information from an attachment.
 Read the supplied files before answering questions about them. Read source pages,
@@ -36,7 +36,67 @@ Use native function calls with the exact supplied tool names, one call at a time
 To finish, reply with the bare final answer as text. Do not call a tool to finish.
 There are no tools named json, answer, or final_answer available to you.
 Do not wrap a tool call in a markdown code block.
+For read_webpage, always supply url as a complete URL taken from the question,
+a search result, or a previous page's source field. To continue that page, call
+read_webpage again with the SAME url and a larger integer offset. This tool has
+no cursor, loc, page ID, or browser state. Do not invent a URL if none is available;
+use web_search to find a source first. Omit optional offsets to start at zero.
 """
+
+
+class ToolResponseError(ValueError):
+    """The model could not produce a usable response within the repair budget."""
+
+
+def argument_problem(tool, arguments):
+    """Validate our tools' scalar inputs before any function is executed."""
+    if not isinstance(arguments, dict):
+        return "Arguments must be a JSON object."
+    inputs = tool.inputs
+    required = {name for name, spec in inputs.items() if not spec.get("nullable", False)}
+    missing = sorted(required - arguments.keys())
+    unknown = sorted(arguments.keys() - inputs.keys())
+    problems = []
+    if missing:
+        problems.append("Missing required arguments: " + ", ".join(missing))
+    if unknown:
+        # Names only; never include generated argument values in the repair note.
+        problems.append("Unrecognized arguments: " + ", ".join(unknown))
+    scalar_types = {"string": str, "integer": int, "number": (int, float), "boolean": bool}
+    for name, value in arguments.items():
+        if name not in inputs:
+            continue
+        expected = inputs[name]["type"]
+        expected_type = scalar_types.get(expected)
+        if expected_type and (not isinstance(value, expected_type)
+                              or (expected in {"integer", "number"} and isinstance(value, bool))):
+            problems.append(f"{name} must be {expected}; omit optional arguments instead of sending null")
+    return "; ".join(problems)
+
+
+def tool_repair_note(tools, failed=None, problem=""):
+    """Explain the exact signature instead of asking the model to retry blindly."""
+    catalog = {tool.name: tool for tool in tools}
+    name = failed.get("name") if isinstance(failed, dict) else None
+    selected = [catalog[name]] if isinstance(name, str) and name in catalog else tools
+    lines = ["The previous response was invalid and was not executed."]
+    if selected and len(selected) == 1 and isinstance(failed, dict):
+        problem = problem or argument_problem(selected[0], failed.get("arguments"))
+    if problem:
+        lines.append(problem + ".")
+    lines.append("Allowed tool arguments:")
+    for tool in selected:
+        fields = [f"{key}: {spec['type']} ({'optional' if spec.get('nullable') else 'required'})"
+                  for key, spec in tool.inputs.items()]
+        lines.append(tool.name + "(" + ", ".join(fields) + ")")
+    lines.extend([
+        "For read_webpage, pass a complete url from the question, search results or a previous source field. "
+        "To read further, keep that url and use offset. cursor and loc are not supported. "
+        "Use web_search first if you do not have a URL; never guess one.",
+        "Make one valid native tool call if more evidence is needed. Otherwise answer in plain text. "
+        "Do not call json, answer or final_answer. If evidence is insufficient and no tool can help, return CANNOT_ANSWER."
+    ])
+    return "\n".join(lines)
 
 
 def native_history(memory):
@@ -127,25 +187,38 @@ class FreePlanModel(OpenAIModel):
             # One bounded repair request for a malformed/empty model response.
             # Quota, authentication, network and unrelated errors still stop.
             for attempt in range(2):
+                failed = None
+                problem = ""
                 self._wait_for_request()
                 try:
                     result = super().generate(messages, **kwargs)
                 except BadRequestError as error:
                     detail = error.body if isinstance(error.body, dict) else {}
                     detail = detail.get("error", detail)
-                    if attempt or detail.get("code") != "tool_use_failed":
+                    if detail.get("code") != "tool_use_failed":
                         raise
+                    try:
+                        failed = json.loads(detail.get("failed_generation", ""))
+                    except (ValueError, TypeError):
+                        pass
+                    if attempt:
+                        raise ToolResponseError("The model repeated an invalid tool call after correction. No answer was saved.") from error
                     result = None
                 if result is not None:
                     if result.tool_calls:
-                        allowed = {tool.name for tool in provider_tools}
+                        allowed = {tool.name: tool for tool in provider_tools}
                         valid = len(result.tool_calls) == 1
                         for call in result.tool_calls:
                             try:
                                 arguments = call.function.arguments
                                 if isinstance(arguments, str):
                                     arguments = json.loads(arguments)
-                                valid = valid and call.function.name in allowed and isinstance(arguments, dict)
+                                failed = {"name": call.function.name, "arguments": arguments}
+                                if call.function.name in allowed:
+                                    problem = argument_problem(allowed[call.function.name], arguments)
+                                else:
+                                    problem = "Use only a listed tool"
+                                valid = valid and not problem
                             except (ValueError, TypeError):
                                 valid = False
                         if valid:
@@ -155,15 +228,10 @@ class FreePlanModel(OpenAIModel):
                     choices = getattr(result.raw, "choices", None) or []
                     reason = getattr(choices[0], "finish_reason", "unknown") if choices else "unknown"
                     if reason == "length":
-                        raise ValueError("Groq reached its output limit. No answer was saved.")
+                        raise ToolResponseError("Groq reached its output limit. No answer was saved.")
                 if attempt:
-                    raise ValueError("Groq returned no usable answer or tool call after one retry. No answer was saved.")
-                self._repair_note = (
-                    "Your last response was empty or had an invalid tool call. "
-                    "Use one of the listed tools if more evidence is needed. "
-                    "Otherwise return the answer as plain text, without JSON or a function call. "
-                    "If evidence is insufficient and no tool can help, return CANNOT_ANSWER."
-                )
+                    raise ToolResponseError("Groq returned no usable answer or tool call after one retry. No answer was saved.")
+                self._repair_note = tool_repair_note(provider_tools, failed, problem)
         finally:
             self._repair_note = None
 

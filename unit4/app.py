@@ -54,7 +54,7 @@ def retry_ui(state, profile: gr.OAuthProfile | None):
     state["checkpoint"]["errors"] = {}
     path = progress_path(state)
     save_checkpoint(state["checkpoint"], path)
-    return "Unfinished questions are ready to retry. Click Run next batch when your quota is available.", rows(state["checkpoint"], get_questions()), path, state
+    return "Unfinished questions are ready to retry. Click Run next batch after addressing the reported error.", rows(state["checkpoint"], get_questions()), path, state
 
 
 def submit_ui(confirmed, state, profile: gr.OAuthProfile | None):
